@@ -3,9 +3,12 @@ package com.nexiles.keycloak;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.keycloak.models.ClientModel;
 import org.keycloak.models.ProtocolMapperModel;
+import org.keycloak.models.RoleModel;
 import org.keycloak.protocol.ProtocolMapperUtils;
 import org.keycloak.protocol.oidc.mappers.OIDCAttributeMapperHelper;
 import org.keycloak.representations.IDToken;
@@ -15,6 +18,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.stubbing.Answer;
 
 import java.util.*;
+import java.util.function.BiConsumer;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.when;
@@ -53,7 +57,7 @@ class UserClientRoleAttributeMappingMapperTest {
     }
 
     @Test
-    void mapClaimWithMultipleAttributes(@Mock IDToken token, @Mock ProtocolMapperModel mappingModel) {
+    void mapClaimWithSingeAttributeAndMultipleValue(@Mock IDToken token, @Mock ProtocolMapperModel mappingModel) {
         final String tokenClaimName = "rules";
         final String attributeName = "attr1";
         final String roleName = "rolename";
@@ -81,7 +85,157 @@ class UserClientRoleAttributeMappingMapperTest {
         assertEquals("attr1value1", traverseClaimMap(claims, tokenClaimName + ".clientid.rolename." + attributeName));
     }
 
-    private <T> Map<String,T> parseJsonObject(String json) {
+    static RoleModel createRole(ClientModel clientModel, String name, String attributesJson) {
+        RoleModel role = new RoleModelStub(name, clientModel);
+        Map<String, List<String>> attributes = parseJsonObject(attributesJson);
+        attributes.forEach(role::setAttribute);
+        return role;
+    }
+
+    static List<String> getAttr(List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes, String clientId, String roleName, String attributeName) {
+        Optional<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> first = filteredAttributes.stream()
+                .filter(clientRoleAttributes -> clientRoleAttributes.clientId().equals(clientId))
+                .filter(clientRoleAttributes -> clientRoleAttributes.roleName().equals(roleName))
+                .findFirst();
+        if (first.isEmpty())
+            throw new RuntimeException(String.format("roleName '%s' '%s' '%s' not found", clientId, roleName, attributeName));
+        return first.get().attributes().getOrDefault(attributeName, new ArrayList<>());
+    }
+
+    static class RoleGen {
+        static final String clientId1 = "clientId1";
+        static final String clientId2 = "clientId2";
+        static final String roleName1 = "rs_dataset0001_role1";
+        static final String roleName2 = "rs_dataset0001_role2";
+        static List<RoleModel> getRoles(ClientModel client1, ClientModel client2) {
+            when(client1.getClientId()).then(invocationOnMock -> clientId1);
+            when(client2.getClientId()).then(invocationOnMock -> clientId2);
+            return new ArrayList<>(List.of(
+                    createRole(client1, roleName1, "{\"a1\":[\"r1a1v1\"],\"a2\":[\"r1a2v1\",\"r1a2v2\"],\"b1\":[\"r1b1v1\"]}"),
+                    createRole(client1, roleName2, "{\"a1\":[\"r2a1v1\",\"r2a1v2\"],\"a2\":[\"r2a2v1\"],\"b1\":[\"r2b1v1\"]}"),
+                    createRole(client2, roleName1, "{\"a1\":[\"r1a1v1\"],\"a2\":[\"r1a2v1\",\"r1a2v2\"],\"b1\":[\"r1b1v1\"]}"),
+                    createRole(client2, roleName2, "{\"a1\":[\"r2a1v1\",\"r2a1v2\"],\"a2\":[\"r2a2v1\"],\"b1\":[\"r2b1v1\"]}")
+            ));
+        }
+
+
+    }
+
+    static void assertFilteredAttributes(List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes, String clientId, String roleName, String attributeName, Boolean negate){
+        BiConsumer<String, String> assertFunction;
+        if (negate) {
+            assertFunction = Assertions::assertNotEquals;
+        } else {
+            assertFunction = Assertions::assertEquals;
+        }
+        if (roleName == null || roleName.equals(RoleGen.roleName1)) {
+            if(attributeName == null || attributeName.equals("a1")) assertFunction.accept("r1a1v1", getAttr(filteredAttributes, clientId, RoleGen.roleName1, "a1").stream().skip(0).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("a2")) assertFunction.accept("r1a2v1", getAttr(filteredAttributes, clientId, RoleGen.roleName1, "a2").stream().skip(0).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("a2")) assertFunction.accept("r1a2v2", getAttr(filteredAttributes, clientId, RoleGen.roleName1, "a2").stream().skip(1).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("b1")) assertFunction.accept("r1b1v1", getAttr(filteredAttributes, clientId, RoleGen.roleName1, "b1").stream().skip(0).findFirst().orElse(null));
+        }
+        if (roleName == null || roleName.equals(RoleGen.roleName2)) {
+            if(attributeName == null || attributeName.equals("a1")) assertFunction.accept("r2a1v1", getAttr(filteredAttributes, clientId, RoleGen.roleName2, "a1").stream().skip(0).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("a1")) assertFunction.accept("r2a1v2", getAttr(filteredAttributes, clientId, RoleGen.roleName2, "a1").stream().skip(1).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("a2")) assertFunction.accept("r2a2v1", getAttr(filteredAttributes, clientId, RoleGen.roleName2, "a2").stream().skip(0).findFirst().orElse(null));
+            if(attributeName == null || attributeName.equals("b1")) assertFunction.accept("r2b1v1", getAttr(filteredAttributes, clientId, RoleGen.roleName2, "b1").stream().skip(0).findFirst().orElse(null));
+        }
+    }
+
+    @Test
+    void getFilteredClientRoleAttributesWithoutAnyLimitations(@Mock ClientModel client1, @Mock ClientModel client2) {
+        List<RoleModel> roles = RoleGen.getRoles(client1, client2);
+
+        List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes = UserClientRoleAttributeMappingMapper.getFilteredClientRoleAttributes(
+                roles.stream(),
+                null,
+                null,
+                null,
+                null
+        ).stream().toList();
+
+        assertEquals(4, filteredAttributes.size());
+        for (String clientId: new String[]{RoleGen.clientId1,RoleGen.clientId2}) {
+            assertFilteredAttributes(filteredAttributes, clientId, null, null, false);
+        }
+    }
+
+    @Test
+    void getFilteredClientRoleAttributesWithClientIdLimitation(@Mock ClientModel client1, @Mock ClientModel client2) {
+        List<RoleModel> roles = RoleGen.getRoles(client1, client2);
+
+        List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes = UserClientRoleAttributeMappingMapper.getFilteredClientRoleAttributes(
+                roles.stream(),
+                RoleGen.clientId1,
+                null,
+                null,
+                null
+        ).stream().toList();
+
+        assertEquals(2, filteredAttributes.size());
+        assertFilteredAttributes(filteredAttributes, RoleGen.clientId1, null, null, false);
+    }
+
+    @Test
+    void getFilteredClientRoleAttributesWithRoleNameLimitations(@Mock ClientModel client1, @Mock ClientModel client2) {
+        List<RoleModel> roles = RoleGen.getRoles(client1, client2);
+
+        List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes = UserClientRoleAttributeMappingMapper.getFilteredClientRoleAttributes(
+                roles.stream(),
+                null,
+                RoleGen.clientId1 + "." + RoleGen.roleName1,
+                null,
+                null
+        ).stream().toList();
+
+        assertEquals(1, filteredAttributes.size());
+        assertFilteredAttributes(filteredAttributes, RoleGen.clientId1, RoleGen.roleName1, null, false);
+    }
+
+    @Test
+    void getFilteredClientRoleAttributesWithAttributeNameLimitations(@Mock ClientModel client1, @Mock ClientModel client2) {
+        List<RoleModel> roles = RoleGen.getRoles(client1, client2);
+
+        List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes = UserClientRoleAttributeMappingMapper.getFilteredClientRoleAttributes(
+                roles.stream(),
+                null,
+                null,
+                "b1",
+                null
+        ).stream().toList();
+
+        assertEquals(4, filteredAttributes.size());
+        for (String clientId: new String[]{RoleGen.clientId1,RoleGen.clientId2}) {
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "b1", false);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "a1", true);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "a2", true);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName2, "b1", false);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName2, "a1", true);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName2, "a2", true);
+        }
+    }
+
+    @Test
+    void getFilteredClientRoleAttributesWithAttributeNamePrefixLimitations(@Mock ClientModel client1, @Mock ClientModel client2) {
+        List<RoleModel> roles = RoleGen.getRoles(client1, client2);
+
+        List<UserClientRoleAttributeMappingMapper.ClientRoleAttributes> filteredAttributes = UserClientRoleAttributeMappingMapper.getFilteredClientRoleAttributes(
+                roles.stream(),
+                null,
+                null,
+                null,
+                "a"
+        ).stream().toList();
+
+        assertEquals(4, filteredAttributes.size());
+        for (String clientId: new String[]{RoleGen.clientId1,RoleGen.clientId2}) {
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "a1", false);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "a2", false);
+            assertFilteredAttributes(filteredAttributes, clientId, RoleGen.roleName1, "b1", true);
+        }
+    }
+
+    private static <T> Map<String,T> parseJsonObject(String json) {
         ObjectMapper mapper = new ObjectMapper();
         TypeReference<HashMap<String, T>> typeRef = new TypeReference<>(){};
         try {

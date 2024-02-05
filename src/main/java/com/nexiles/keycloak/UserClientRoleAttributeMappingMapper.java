@@ -1,7 +1,5 @@
 package com.nexiles.keycloak;
 
-import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import org.jboss.logging.Logger;
 import org.keycloak.models.*;
 import org.keycloak.protocol.ProtocolMapperUtils;
@@ -13,6 +11,7 @@ import javax.annotation.Nullable;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.keycloak.utils.JsonUtils.splitClaimPath;
 
@@ -38,6 +37,8 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
     static final String USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_CLIENT_ID = "usermodel.clientRoleAttributeMapping.clientId";
     static final String USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_NAME = "usermodel.clientRoleAttributeMapping.clientRoleName";
     static final String USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_ATTRIBUTE_NAME = "usermodel.clientRoleAttributeMapping.clientRoleAttributeName";
+
+    static final String USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_ATTRIBUTE_NAME_PREFIX = "usermodel.clientRoleAttributeMapping.clientRoleAttributeNamePrefix";
 
     static final String USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_ADD_CLIENT_ID = "usermodel.clientRoleAttributeMapping.addClientId";
     static final String USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_ADD_ROLE_NAME = "usermodel.clientRoleAttributeMapping.addRoleName";
@@ -65,6 +66,13 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
         attributeName.setHelpText("The Attribute Name for attribute mappings. Just client role attributes with that name will be added to the token. If this is unset, all attributes of the client role will be added to the token.");
         attributeName.setType(ProviderConfigProperty.STRING_TYPE);
         CONFIG_PROPERTIES.add(attributeName);
+
+        final ProviderConfigProperty attributeNamePrefix = new ProviderConfigProperty();
+        attributeNamePrefix.setName(USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_ATTRIBUTE_NAME_PREFIX);
+        attributeNamePrefix.setLabel("Attribute Name Prefix");
+        attributeNamePrefix.setHelpText("The Attribute Name Prefix for attribute mappings. Just client role attributes with a name prefixed with this value will be added to the token. If this is unset, no prefix filter is applied.");
+        attributeNamePrefix.setType(ProviderConfigProperty.STRING_TYPE);
+        CONFIG_PROPERTIES.add(attributeNamePrefix);
 
         final ProviderConfigProperty addClientId = new ProviderConfigProperty();
         addClientId.setName(USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_ADD_CLIENT_ID);
@@ -139,9 +147,10 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
         final String clientId = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_CLIENT_ID);
         final String clientRoleName = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_NAME);
         final String attributeName = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_ATTRIBUTE_NAME);
+        final String attributeNamePrefix = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_MAPPING_CLIENT_ROLE_ATTRIBUTE_NAME_PREFIX);
 
         final Set<ClientRoleAttributes> resolvedClientRoleAttributes =
-                getAndCacheResolvedClientRolesAttributes(session, clientSessionCtx, clientId, clientRoleName, attributeName);
+                getAndCacheResolvedClientRolesAttributes(session, clientSessionCtx, clientId, clientRoleName, attributeName, attributeNamePrefix);
 
         if (resolvedClientRoleAttributes.isEmpty())
             return;
@@ -181,7 +190,7 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
             return;
         }
 
-        String clientId = clientRoleAttributes.getClientId();
+        String clientId = clientRoleAttributes.clientId();
 
         if (clientId != null) {
             // case when clientId contains dots
@@ -194,7 +203,7 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
             tokenClaimNamePrefix = tokenClaimNamePrefix.concat("." + clientId);
         }
 
-        final Set<Map.Entry<String, List<String>>> attributeEntry = clientRoleAttributes.getAttributes().entrySet();
+        final Set<Map.Entry<String, List<String>>> attributeEntry = clientRoleAttributes.attributes().entrySet();
         for (final Map.Entry<String, List<String>> entry : attributeEntry) {
             String tokenClaimName = tokenClaimNamePrefix;
 
@@ -202,7 +211,7 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
 
             final boolean addRoleName = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_ADD_ROLE_NAME).equals("true");
             if (addRoleName) {
-                tokenClaimName = tokenClaimName.concat("." + clientRoleAttributes.getRoleName());
+                tokenClaimName = tokenClaimName.concat("." + clientRoleAttributes.roleName());
             }
 
             final boolean addAttributeName = mappingModel.getConfig().get(USER_MODEL_CLIENT_ROLE_ATTRIBUTE_MAPPING_ADD_ATTRIBUTE_NAME).equals("true");
@@ -288,8 +297,8 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
      * @return all filtered client role attributes.
      */
     @SuppressWarnings("unchecked")
-    public static Set<ClientRoleAttributes> getAndCacheResolvedClientRolesAttributes(KeycloakSession session, ClientSessionContext clientSessionCtx,
-                                                                                     @Nullable String clientId, @Nullable String clientRoleName, @Nullable String attributeName) {
+    static Set<ClientRoleAttributes> getAndCacheResolvedClientRolesAttributes(KeycloakSession session, ClientSessionContext clientSessionCtx,
+                                                                                     @Nullable String clientId, @Nullable String clientRoleName, @Nullable String attributeName, @Nullable String attributeNamePrefix) {
 
         final ClientModel client = clientSessionCtx.getClientSession().getClient();
 
@@ -298,16 +307,12 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
 
         if (resolvedClientRoleAttributes == null) {
 
-            logger.tracef("Resolve - clientId: %s clientRoleName: %s - attributeName: %s",
-                    clientId, clientRoleName, attributeName);
+            logger.tracef("Resolve - clientId: %s clientRoleName: %s - attributeName: %s attributeNamePrefix: %s",
+                    clientId, clientRoleName, attributeName, attributeNamePrefix);
 
-            final Set<ClientRoleAttributes> filteredClientRoleAttributes = clientSessionCtx.getRolesStream() // Get roles of authenticated client
-                    .filter(RoleModel::isClientRole)
-                    .filter(clientRole -> clientId == null || clientId.equals(clientModelForRole(clientRole).getClientId()))
-                    .filter(clientRole -> clientRoleName == null || clientRoleNameEquals(clientRole, clientRoleName))
-                    .filter(clientRole -> attributeName == null || clientRole.getAttributes().containsKey(attributeName))
-                    .map(ClientRoleAttributes::fromRoleModel)
-                    .collect(Collectors.toSet());
+            final Set<ClientRoleAttributes> filteredClientRoleAttributes = getFilteredClientRoleAttributes(
+                    clientSessionCtx.getRolesStream(), clientId, clientRoleName, attributeName, attributeNamePrefix
+            );
 
             logger.tracef("Filtered: %s", filteredClientRoleAttributes);
 
@@ -319,6 +324,23 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
         logger.tracef("Cached: %s", resolvedClientRoleAttributes);
 
         return resolvedClientRoleAttributes;
+    }
+
+    static Set<ClientRoleAttributes> getFilteredClientRoleAttributes(Stream<RoleModel> rolesStream, @Nullable String clientId, @Nullable String clientRoleName, @Nullable String attributeName, @Nullable String attributeNamePrefix){
+        return rolesStream // Get roles of authenticated client
+            .filter(RoleModel::isClientRole)
+            .filter(clientRole -> clientId == null || clientId.equals(clientModelForRole(clientRole).getClientId()))
+            .filter(clientRole -> clientRoleName == null || clientRoleNameEquals(clientRole, clientRoleName))
+            .filter(clientRole -> attributeName == null || clientRole.getAttributes().containsKey(attributeName))
+            .map(clientRole -> new ClientRoleAttributes(
+                    clientModelForRole(clientRole).getClientId(),
+                    clientRole.getName(),
+                    clientRole.getAttributes().entrySet().stream()
+                            .filter(es -> attributeName == null || es.getKey().equals(attributeName))
+                            .filter(es -> attributeNamePrefix == null || es.getKey().startsWith(attributeNamePrefix))
+                            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))
+            ))
+            .collect(Collectors.toSet());
     }
 
     /**
@@ -347,24 +369,7 @@ public class UserClientRoleAttributeMappingMapper extends AbstractOIDCProtocolMa
     /**
      * Simple wrapper to bundle client > role > attributes information.
      */
-    @Getter
-    @RequiredArgsConstructor
-    static class ClientRoleAttributes {
-
-        private final String clientId;
-
-        private final String roleName;
-
-        private final Map<String, List<String>> attributes;
-
-        static ClientRoleAttributes fromRoleModel(RoleModel roleModel) {
-            return new ClientRoleAttributes(
-                    clientModelForRole(roleModel).getClientId(),
-                    roleModel.getName(),
-                    roleModel.getAttributes()
-            );
-        }
-
+    record ClientRoleAttributes(String clientId, String roleName, Map<String, List<String>> attributes) {
         @Override
         public String toString() {
             return String.format("(clientId: '%s' roleName: '%s' - attributes: %s)", clientId, roleName, attributes);
